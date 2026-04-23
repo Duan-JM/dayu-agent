@@ -15,6 +15,7 @@ from dayu.market.models import (
     MARKET_ERROR_CONFIG,
     MARKET_ERROR_DATA,
     MARKET_ERROR_DEPENDENCY,
+    safe_float,
 )
 
 # tushare 频率映射
@@ -24,34 +25,6 @@ _FREQ_MAP: dict[BarFrequency, str] = {
     BarFrequency.MONTHLY: "M",
 }
 
-
-def _safe_float(value: float | int | str | None, default: float = 0.0) -> float:
-    """将 pandas Series 取出的值安全转为 float。
-
-    pandas DataFrame 中缺失值为 NaN 或 None，``row.get(col, 0)`` 在列存在但值为
-    None 时不会返回默认值，而是返回 None，导致 ``float(None)`` 抛 TypeError。
-
-    Args:
-        value: 从 DataFrame row 取出的原始值。
-        default: 转换失败时的兜底值。
-
-    Returns:
-        转换后的浮点数。
-
-    Raises:
-        无。
-    """
-
-    if value is None:
-        return default
-    try:
-        result = float(value)
-        # pandas NaN 处理
-        if result != result:  # NaN check
-            return default
-        return result
-    except (TypeError, ValueError):
-        return default
 
 
 def _ensure_tushare_available() -> object:
@@ -200,15 +173,15 @@ class TushareProvider:
             return RealtimeQuoteData(
                 symbol=symbol,
                 name=name,
-                price=_safe_float(row.get("close")),
-                change=_safe_float(row.get("change")),
-                change_pct=_safe_float(row.get("pct_chg")),
-                open=_safe_float(row.get("open")),
-                high=_safe_float(row.get("high")),
-                low=_safe_float(row.get("low")),
-                prev_close=_safe_float(row.get("pre_close")),
-                volume=_safe_float(row.get("vol")) * 100,  # tushare vol 单位是手，转为股
-                amount=_safe_float(row.get("amount")) * 1000,  # tushare amount 单位是千元，转为元
+                price=safe_float(row.get("close")),
+                change=safe_float(row.get("change")),
+                change_pct=safe_float(row.get("pct_chg")),
+                open=safe_float(row.get("open")),
+                high=safe_float(row.get("high")),
+                low=safe_float(row.get("low")),
+                prev_close=safe_float(row.get("pre_close")),
+                volume=safe_float(row.get("vol")) * 100,  # tushare vol 单位是手，转为股
+                amount=safe_float(row.get("amount")) * 1000,  # tushare amount 单位是千元，转为元
                 timestamp=_format_trade_date(trade_date),
             )
         except MarketDataError:
@@ -276,12 +249,12 @@ class TushareProvider:
                 bars.append(
                     BarData(
                         date=_format_trade_date_short(trade_date),
-                        open=_safe_float(row.get("open")),
-                        high=_safe_float(row.get("high")),
-                        low=_safe_float(row.get("low")),
-                        close=_safe_float(row.get("close")),
-                        volume=_safe_float(row.get("vol")) * 100,
-                        amount=_safe_float(row.get("amount")) * 1000,
+                        open=safe_float(row.get("open")),
+                        high=safe_float(row.get("high")),
+                        low=safe_float(row.get("low")),
+                        close=safe_float(row.get("close")),
+                        volume=safe_float(row.get("vol")) * 100,
+                        amount=safe_float(row.get("amount")) * 1000,
                     )
                 )
 

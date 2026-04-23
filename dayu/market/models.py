@@ -116,6 +116,34 @@ MARKET_ERROR_DATA = "MARKET_DATA_ERROR"
 MARKET_ERROR_DEPENDENCY = "MARKET_DEPENDENCY_ERROR"
 
 
+def safe_float(value: float | int | str | None, default: float = 0.0) -> float:
+    """将 pandas Series 取出的值安全转为 float。
+
+    pandas DataFrame 中缺失值为 NaN 或 None，``row.get(col, 0)`` 在列存在但值为
+    None 时不会返回默认值，而是返回 None，导致 ``float(None)`` 抛 TypeError。
+
+    Args:
+        value: 从 DataFrame row 取出的原始值。
+        default: 转换失败时的兜底值。
+
+    Returns:
+        转换后的浮点数。
+
+    Raises:
+        无。
+    """
+
+    if value is None:
+        return default
+    try:
+        result = float(value)
+        if result != result:  # NaN check
+            return default
+        return result
+    except (TypeError, ValueError):
+        return default
+
+
 __all__ = [
     "BarFrequency",
     "BarData",
@@ -125,4 +153,5 @@ __all__ = [
     "MARKET_ERROR_INVALID_TICKER",
     "MARKET_ERROR_DATA",
     "MARKET_ERROR_DEPENDENCY",
+    "safe_float",
 ]
