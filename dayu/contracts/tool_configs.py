@@ -79,6 +79,23 @@ class FinsToolLimits:
 
 
 @dataclass(frozen=True)
+class MarketToolLimits:
+    """行情工具限制配置。
+
+    Args:
+        history_max_bars: ``get_stock_history`` 最大返回 K 线数。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    history_max_bars: int = 500
+
+
+@dataclass(frozen=True)
 class WebToolsConfig:
     """联网工具配置。
 
@@ -252,12 +269,34 @@ def build_web_tools_config(snapshot: ToolsetConfigSnapshot | None) -> WebToolsCo
             field_name="web.fetch_truncate_chars",
             default=defaults.fetch_truncate_chars,
         ),
-        allow_private_network_url=bool(
-            payload.get("allow_private_network_url", defaults.allow_private_network_url)
-        ),
+        allow_private_network_url=bool(payload.get("allow_private_network_url", defaults.allow_private_network_url)),
         playwright_channel=str(payload.get("playwright_channel", defaults.playwright_channel)),
         playwright_storage_state_dir=str(
             payload.get("playwright_storage_state_dir", defaults.playwright_storage_state_dir)
+        ),
+    )
+
+
+def build_market_tool_limits(snapshot: ToolsetConfigSnapshot | None) -> MarketToolLimits:
+    """从通用 toolset 快照恢复行情工具限制。
+
+    Args:
+        snapshot: 行情工具的通用配置快照。
+
+    Returns:
+        恢复后的行情工具限制配置。
+
+    Raises:
+        TypeError: 当快照字段类型非法时抛出。
+    """
+
+    payload = snapshot.payload if snapshot is not None else {}
+    defaults = MarketToolLimits()
+    return MarketToolLimits(
+        history_max_bars=coerce_toolset_config_int(
+            payload.get("history_max_bars"),
+            field_name="market.history_max_bars",
+            default=defaults.history_max_bars,
         ),
     )
 
@@ -361,10 +400,12 @@ def build_legacy_toolset_configs(
 __all__ = [
     "DocToolLimits",
     "FinsToolLimits",
+    "MarketToolLimits",
     "WebToolsConfig",
     "build_doc_tool_limits",
     "build_fins_tool_limits",
     "build_legacy_toolset_configs",
+    "build_market_tool_limits",
     "build_web_tools_config",
     "resolve_doc_tool_limits_from_toolset_configs",
     "resolve_fins_tool_limits_from_toolset_configs",
