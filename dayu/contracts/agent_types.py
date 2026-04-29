@@ -7,7 +7,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Protocol, TypeAlias, TypedDict
+from typing import Literal, NotRequired, Protocol, TypeAlias, TypedDict
+
+
+JsonScalar: TypeAlias = str | int | float | bool | None
+"""JSON 标量值。"""
+
+
+JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+"""递归 JSON 值。"""
+
+
+ExtraContentPayload: TypeAlias = dict[str, dict[str, JsonValue]]
+"""provider 私有 ``extra_content`` 透传负载。"""
 
 
 class FunctionToolCallPayload(TypedDict):
@@ -23,6 +35,7 @@ class ToolCallPayload(TypedDict):
     id: str
     type: Literal["function"]
     function: FunctionToolCallPayload
+    extra_content: NotRequired[ExtraContentPayload]
 
 
 class SystemChatMessage(TypedDict):
