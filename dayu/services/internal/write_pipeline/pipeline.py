@@ -439,6 +439,10 @@ class WritePipelineRunner:
                 existing_result = chapter_results.get(task.title)
                 if self._should_skip_with_resume(existing_result):
                     Log.info(f"[单章模式] 显式指定章节，强制重跑: {task.title}", module=MODULE)
+                # 单章重跑必须先清空旧产物，否则后续 fallback 路径
+                # 会读到陈旧的最终正文/中间稿，污染本次重写结果。
+                self._store.purge_chapter_artifacts(task)
+                chapter_results.pop(task.title, None)
                 try:
                     result = self._run_single_chapter(
                         task=task,
@@ -479,7 +483,7 @@ class WritePipelineRunner:
             # 单章模式且目标既不是第0章概览章也不是决策章，跳过 decision + overview + 来源清单 + 报告组装
             single_result = chapter_results.get(chapter_filter)
             Log.info(f"[单章模式] 完成：{chapter_filter}", module=MODULE)
-            return 0 if self._did_chapter_succeed_in_current_mode(single_result) else 4
+            return 0 if self._satisfies_audit_gate_for_current_mode(single_result) else 4
 
         decision_result: ChapterResult | None = None
         decision_chapter = chapters_by_title.get(_DECISION_CHAPTER_TITLE)
@@ -529,6 +533,9 @@ class WritePipelineRunner:
                         Log.info(f"跳过已完成章节: {_DECISION_CHAPTER_TITLE}", module=MODULE)
                         decision_result = existing_decision
                 if decision_result is None:
+                    # 统一原则：章节即将重写时清空旧阶段产物，避免读到陈旧最终正文/中间稿。
+                    self._store.purge_chapter_artifacts(decision_task)
+                    chapter_results.pop(_DECISION_CHAPTER_TITLE, None)
                     self._check_cancellation()
                     try:
                         decision_result = self._run_single_chapter(
@@ -560,7 +567,7 @@ class WritePipelineRunner:
 
         if chapter_filter == _DECISION_CHAPTER_TITLE:
             Log.info(f"[单章模式] 完成：{_DECISION_CHAPTER_TITLE}", module=MODULE)
-            return 0 if self._did_chapter_succeed_in_current_mode(decision_result) else 4
+            return 0 if self._satisfies_audit_gate_for_current_mode(decision_result) else 4
 
         overview_task = ChapterTask(
             index=chapters_by_title[_OVERVIEW_CHAPTER_TITLE].index,
@@ -573,10 +580,17 @@ class WritePipelineRunner:
             item_rules=chapters_by_title[_OVERVIEW_CHAPTER_TITLE].item_rules,
         )
         existing_overview = chapter_results.get(_OVERVIEW_CHAPTER_TITLE)
+        if chapter_filter == _OVERVIEW_CHAPTER_TITLE:
+            if self._should_skip_with_resume(existing_overview):
+                Log.info(f"[单章模式] 显式指定章节，强制重跑: {_OVERVIEW_CHAPTER_TITLE}", module=MODULE)
+            existing_overview = None
         if self._should_skip_with_resume(existing_overview):
             Log.info(f"跳过已完成章节: {_OVERVIEW_CHAPTER_TITLE}", module=MODULE)
             overview_result = existing_overview
         else:
+            # 统一原则：章节即将重写时清空旧阶段产物，避免读到陈旧最终正文/中间稿。
+            self._store.purge_chapter_artifacts(overview_task)
+            chapter_results.pop(_OVERVIEW_CHAPTER_TITLE, None)
             overview_dependency_tasks = _build_overview_dependency_tasks(layout)
             if chapter_filter == _OVERVIEW_CHAPTER_TITLE and not self._write_config.force:
                 resolved_overview_results, precheck_errors = self._resolve_overview_single_chapter_prerequisites(
@@ -643,7 +657,7 @@ class WritePipelineRunner:
         if chapter_filter == _OVERVIEW_CHAPTER_TITLE:
             # 单章模式且目标为第0章概览章，跳过来源清单和报告组装
             Log.info(f"[单章模式] 完成：{_OVERVIEW_CHAPTER_TITLE}", module=MODULE)
-            return 0 if self._did_chapter_succeed_in_current_mode(overview_result) else 4
+            return 0 if self._satisfies_audit_gate_for_current_mode(overview_result) else 4
 
         source_chapter_markdown: str | None = None
         if has_source_chapter:
@@ -669,7 +683,7 @@ class WritePipelineRunner:
         summary_payload = self._execution_summary_builder.build_summary(
             chapter_results,
             output_file=output_file,
-            success_predicate=self._did_chapter_succeed_in_current_mode,
+            success_predicate=self._satisfies_audit_gate_for_current_mode,
         )
         (self._output_dir / "run_summary.json").write_text(
             json.dumps(summary_payload, ensure_ascii=False, indent=2),
@@ -734,6 +748,9 @@ class WritePipelineRunner:
             if self._should_skip_with_resume(existing_result):
                 Log.info(f"跳过已完成章节: {task.title}", module=MODULE)
                 continue
+            # 统一原则：章节即将重写时清空旧阶段产物，避免读到陈旧最终正文/中间稿。
+            self._store.purge_chapter_artifacts(task)
+            chapter_results.pop(task.title, None)
             pending_tasks.append(task)
         if not pending_tasks:
             return chapter_results
@@ -1038,21 +1055,6 @@ class WritePipelineRunner:
             return True
         return bool(result.audit_passed)
 
-    def _did_chapter_succeed_in_current_mode(self, result: ChapterResult | None) -> bool:
-        """判断章节在当前运行模式下是否算成功。
-
-        Args:
-            result: 待检查章节结果。
-
-        Returns:
-            当前模式下成功返回 ``True``。
-
-        Raises:
-            无。
-        """
-
-        return self._satisfies_audit_gate_for_current_mode(result)
-
     def _recover_prior_chapter_result_from_artifacts(
         self, task: ChapterTask
     ) -> tuple[ChapterResult | None, str]:
@@ -1122,7 +1124,11 @@ class WritePipelineRunner:
                 return self._write_config.ticker
             resolved_name = str(self._company_name_resolver(self._write_config.ticker) or "").strip()
             return resolved_name or self._write_config.ticker
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            Log.warning(
+                f"company_name 解析失败，回退 ticker: ticker={self._write_config.ticker} error={exc}",
+                module=MODULE,
+            )
             return self._write_config.ticker
 
     def _resolve_company_meta_summary(self) -> dict[str, str]:
@@ -1151,7 +1157,11 @@ class WritePipelineRunner:
             }
             normalized.setdefault("ticker", self._write_config.ticker)
             return normalized
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            Log.warning(
+                f"company_meta_summary 解析失败，回退最小 meta: ticker={self._write_config.ticker} error={exc}",
+                module=MODULE,
+            )
             return {"ticker": self._write_config.ticker}
 
     def _ensure_company_facets(self, *, manifest: RunManifest, company_name: str) -> CompanyFacetProfile | None:
@@ -1237,7 +1247,7 @@ class WritePipelineRunner:
         if existing_result is None:
             return False
         # resume 只跳过在“当前运行门槛”下已完成的章节。
-        return self._did_chapter_succeed_in_current_mode(existing_result)
+        return self._satisfies_audit_gate_for_current_mode(existing_result)
 
     def _merge_historical_chapter_results_for_single_chapter(
         self, chapter_results: dict[str, ChapterResult]
