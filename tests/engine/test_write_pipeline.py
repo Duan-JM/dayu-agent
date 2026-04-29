@@ -3094,6 +3094,269 @@ def test_run_single_chapter_evidence_section_missing_triggers_rewrite(
 
 
 @pytest.mark.unit
+def test_evaluate_current_chapter_phase_post_repair_programmatic_fail_does_not_stop_loop(
+    tmp_path: Path,
+) -> None:
+    """验证 repair phase 后 programmatic 失败不再设置 stop_rewrite_loop（#39）。
+
+    场景：repair_1 phase 的产物缺少"### 证据与出处"小节（P3 失败）。
+    期望：
+    - `stop_rewrite_loop` 保持 False，状态机由外层依据 `retry_count >= write_max_retries` 决定是否退出；
+    - audit_decision 写入并自带 repair_strategy='regenerate'（来自 _derive_repair_strategy）；
+    - process_state 留下 post_repair_programmatic_fail=True 标记。
+    """
+
+    runner = _build_runner(tmp_path)
+    task = ChapterTask(index=2, title="公司介绍", skeleton="## 公司介绍\n\n### 证据与出处\n")
+    execution_state = ChapterExecutionState(
+        task=task,
+        company_name="Apple",
+        current_content="## 公司介绍\n\n正文很短没有证据小节",
+        allowed_conditional_headings=set(),
+        process_state=build_process_state_template(),
+        phase="repair_1",
+        retry_count=1,
+    )
+
+    runner._chapter_audit_coordinator.evaluate_current_chapter_phase(
+        execution_state=execution_state,
+        company_facets=None,
+        company_facet_catalog={},
+    )
+
+    assert execution_state.stop_rewrite_loop is False
+    assert execution_state.audit_decision is not None
+    assert execution_state.audit_decision.passed is False
+    assert execution_state.audit_decision.repair_contract.repair_strategy == "regenerate"
+    assert execution_state.process_state.get("post_repair_programmatic_fail") is True
+
+
+@pytest.mark.unit
+def test_run_single_chapter_repair_phase_programmatic_failure_triggers_regenerate_when_budget_remains(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """验证 repair patch 破坏结构后，预算未尽时自动升级到 regenerate 并恢复（#39）。
+
+    时序：
+    - 初稿合规 → LLM audit 失败给出 patch 类违规；
+    - repair_1 patch 输出破坏骨架结构 → programmatic P1 失败；
+    - 状态机原本会 stop，修复后改为按 audit_decision 自带 regenerate strategy 推进；
+    - regenerate_2 重建为合规内容 → audit pass → status=passed。
+    """
+
+    runner = _build_runner(tmp_path)
+    runner._write_config.write_max_retries = 2
+
+    initial_content = (
+        "## 公司介绍\n\n"
+        "### 结论要点\n\n- 苹果公司业务覆盖消费电子\n\n"
+        "### 详细情况\n\n- 主营 iPhone 与服务\n\n"
+        "### 证据与出处\n"
+        "- SEC EDGAR | Form 10-K | Filed 2025-01-01 | Accession 0000000001-25-000001 | Part I - Item 1\n"
+    )
+    # repair patch 破坏了骨架（删掉了"### 结论要点"），P1 程序审计会失败
+    broken_after_repair = (
+        "## 公司介绍\n\n"
+        "正文被 patch 破坏，缺少结论要点小节\n\n"
+        "### 证据与出处\n"
+        "- SEC EDGAR | Form 10-K | Filed 2025-01-01 | Accession 0000000001-25-000001 | Part I - Item 1\n"
+    )
+    regenerate_content = (
+        "## 公司介绍\n\n"
+        "### 结论要点\n\n- 重建后核心要点\n\n"
+        "### 详细情况\n\n- 重建后详细描述足够长\n\n"
+        "### 证据与出处\n"
+        "- SEC EDGAR | Form 10-K | Filed 2025-01-01 | Accession 0000000001-25-000001 | Part I - Item 1\n"
+    )
+
+    audit_calls: list[str] = []
+
+    def _mock_audit_and_confirm(
+        *,
+        chapter_markdown: str,
+        company_name: str,
+        skeleton: str,
+        chapter_contract: dict[str, object],
+        item_rules: list[dict[str, object]],
+        phase: str,
+        chapter_title: str,
+        repair_contract: dict[str, object] | None = None,
+    ) -> tuple[AuditDecision, AuditDecision, EvidenceConfirmationResult | None]:
+        del company_name, skeleton, chapter_contract, item_rules, chapter_title, repair_contract
+        audit_calls.append(phase)
+        # 通过当前 markdown 内容判断当前是初稿还是 repair 后产物
+        if "苹果公司业务覆盖消费电子" in chapter_markdown and "正文被 patch 破坏" not in chapter_markdown:
+            violation = Violation(
+                rule=AuditRuleCode.C1,
+                severity="high",
+                excerpt="苹果公司业务覆盖消费电子",
+                reason="内容违规",
+            )
+            decision = AuditDecision(
+                passed=False,
+                category=AuditCategory.CONTENT_VIOLATION,
+                violations=[violation],
+                notes=["精简结论"],
+                repair_contract=RepairContract(repair_strategy="patch"),
+                raw='{"pass": false}',
+            )
+            return decision, decision, None
+        ok = AuditDecision(passed=True, category=AuditCategory.OK, raw='{"pass": true}')
+        return ok, ok, None
+
+    monkeypatch.setattr(runner._prompt_runner, "run_write_prompt", _SequenceCaller([initial_content]))
+    # repair_executor 实际会调 run_repair_prompt 应用补丁，这里直接拦截 _apply_pending_chapter_rewrite
+    # 太重；改为拦截 repair plan 应用结果——劫持 _run_repair_prompt 与 _apply_repair_plan 的下游
+    # 简化：直接覆盖 ChapterExecutionCoordinator._apply_pending_chapter_rewrite，根据 phase 写不同结果
+    original_apply = runner._chapter_execution_coordinator._apply_pending_chapter_rewrite
+
+    def _fake_apply(*, execution_state: ChapterExecutionState) -> None:
+        phase = execution_state.phase
+        if phase == "repair_1":
+            execution_state.current_content = broken_after_repair
+            # 提交 retry_count（模拟原 apply 末尾的 _commit_successful_chapter_rewrite）
+            runner._chapter_execution_coordinator._commit_successful_chapter_rewrite(
+                execution_state=execution_state,
+                audit_decision=execution_state.audit_decision,  # type: ignore[arg-type]
+            )
+            return
+        if phase == "regenerate_2":
+            execution_state.current_content = regenerate_content
+            runner._chapter_execution_coordinator._commit_successful_chapter_rewrite(
+                execution_state=execution_state,
+                audit_decision=execution_state.audit_decision,  # type: ignore[arg-type]
+            )
+            return
+        original_apply(execution_state=execution_state)
+
+    monkeypatch.setattr(
+        runner._chapter_execution_coordinator,
+        "_apply_pending_chapter_rewrite",
+        _fake_apply,
+    )
+    monkeypatch.setattr(
+        runner._chapter_audit_coordinator,
+        "audit_and_confirm_chapter",
+        _mock_audit_and_confirm,
+    )
+
+    task = ChapterTask(index=2, title="公司介绍", skeleton="## 公司介绍\n\n### 结论要点\n\n### 详细情况\n\n### 证据与出处\n")
+    result = runner._run_single_chapter(
+        task=task,
+        company_name="Apple",
+        prompt_name="write_chapter",
+        prompt_inputs=runner._prompter._build_chapter_prompt_inputs(task=task, company_name="Apple"),
+    )
+
+    assert result.status == "passed"
+    assert result.retry_count == 2
+    assert result.process_state.get("post_repair_programmatic_fail") is True
+    # 验证 phase 走了 initial → repair_1 → regenerate_2
+    audit_phases = [entry["phase"] for entry in result.process_state.get("audit_history", [])]
+    assert "initial" in audit_phases
+    assert "repair_1" in audit_phases
+    assert "regenerate_2" in audit_phases
+
+
+@pytest.mark.unit
+def test_run_single_chapter_repair_phase_programmatic_failure_stops_when_budget_exhausted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """验证预算耗尽时仍按状态机既有规则收口（#39）。
+
+    write_max_retries=1 时，初稿失败 → repair_1 破坏结构 → programmatic 失败，
+    状态机此时 retry_count==1 等于上限，按 L431-434 既有规则进 COMPLETE，
+    章节走 fallback 走 failed status——不会因 #39 修复而无限循环。
+    """
+
+    runner = _build_runner(tmp_path)
+    runner._write_config.write_max_retries = 1
+
+    initial_content = (
+        "## 公司介绍\n\n"
+        "### 结论要点\n\n- 苹果公司业务覆盖消费电子\n\n"
+        "### 详细情况\n\n- 主营 iPhone 与服务\n\n"
+        "### 证据与出处\n"
+        "- SEC EDGAR | Form 10-K | Filed 2025-01-01 | Accession 0000000001-25-000001 | Part I - Item 1\n"
+    )
+    broken_after_repair = (
+        "## 公司介绍\n\n"
+        "正文被 patch 破坏，缺少结论要点小节\n\n"
+        "### 证据与出处\n"
+        "- SEC EDGAR | Form 10-K | Filed 2025-01-01 | Accession 0000000001-25-000001 | Part I - Item 1\n"
+    )
+
+    def _mock_audit_and_confirm(
+        *,
+        chapter_markdown: str,
+        company_name: str,
+        skeleton: str,
+        chapter_contract: dict[str, object],
+        item_rules: list[dict[str, object]],
+        phase: str,
+        chapter_title: str,
+        repair_contract: dict[str, object] | None = None,
+    ) -> tuple[AuditDecision, AuditDecision, EvidenceConfirmationResult | None]:
+        del company_name, skeleton, chapter_contract, item_rules, phase, chapter_title, repair_contract
+        is_initial = "苹果公司业务覆盖消费电子" in chapter_markdown and "正文被 patch 破坏" not in chapter_markdown
+        if is_initial:
+            violation = Violation(
+                rule=AuditRuleCode.C1,
+                severity="high",
+                excerpt="苹果公司业务覆盖消费电子",
+                reason="内容违规",
+            )
+            decision = AuditDecision(
+                passed=False,
+                category=AuditCategory.CONTENT_VIOLATION,
+                violations=[violation],
+                notes=["精简结论"],
+                repair_contract=RepairContract(repair_strategy="patch"),
+                raw='{"pass": false}',
+            )
+            return decision, decision, None
+        ok = AuditDecision(passed=True, category=AuditCategory.OK, raw='{"pass": true}')
+        return ok, ok, None
+
+    monkeypatch.setattr(runner._prompt_runner, "run_write_prompt", _SequenceCaller([initial_content]))
+
+    def _fake_apply(*, execution_state: ChapterExecutionState) -> None:
+        if execution_state.phase == "repair_1":
+            execution_state.current_content = broken_after_repair
+            runner._chapter_execution_coordinator._commit_successful_chapter_rewrite(
+                execution_state=execution_state,
+                audit_decision=execution_state.audit_decision,  # type: ignore[arg-type]
+            )
+            return
+        raise AssertionError(f"预算耗尽后不应再进入 phase={execution_state.phase}")
+
+    monkeypatch.setattr(
+        runner._chapter_execution_coordinator,
+        "_apply_pending_chapter_rewrite",
+        _fake_apply,
+    )
+    monkeypatch.setattr(
+        runner._chapter_audit_coordinator,
+        "audit_and_confirm_chapter",
+        _mock_audit_and_confirm,
+    )
+
+    task = ChapterTask(index=2, title="公司介绍", skeleton="## 公司介绍\n\n### 结论要点\n\n### 详细情况\n\n### 证据与出处\n")
+    result = runner._run_single_chapter(
+        task=task,
+        company_name="Apple",
+        prompt_name="write_chapter",
+        prompt_inputs=runner._prompter._build_chapter_prompt_inputs(task=task, company_name="Apple"),
+    )
+
+    # 预算耗尽：retry_count==write_max_retries，状态机按既有规则进 COMPLETE
+    assert result.retry_count == 1
+    assert result.process_state.get("post_repair_programmatic_fail") is True
+    # 章节最终未通过审计（破坏结构后无机会重试）
+    assert result.status == "failed"
+
+
+@pytest.mark.unit
 def test_should_run_fix_placeholders_detects_common_patterns() -> None:
     """验证占位符检测规则可识别常见占位符文本。
 
@@ -8109,6 +8372,200 @@ def test_run_middle_tasks_in_parallel_stops_dispatching_after_scene_creation_err
     assert "C" not in started_titles
     assert "D" not in started_titles
     assert set(started_titles).issubset({"A", "B"})
+
+
+@pytest.mark.unit
+def test_run_middle_tasks_in_parallel_persists_completed_chapters_before_raise(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """验证中间章节批次异常 unwind 前会先把已完成章节持久化到 store 与 manifest。"""
+
+    runner = _build_runner(tmp_path)
+    monkeypatch.setattr(runner, "_resolve_middle_worker_limit", lambda: 1)
+
+    middle_tasks = [
+        ChapterTask(index=1, title="A", skeleton="## A"),
+        ChapterTask(index=2, title="B", skeleton="## B"),
+        ChapterTask(index=3, title="C", skeleton="## C"),
+    ]
+
+    persisted_chapter_titles: list[str] = []
+    persisted_manifest_snapshots: list[list[str]] = []
+
+    def _record_persist_chapter(result: ChapterResult) -> None:
+        persisted_chapter_titles.append(result.title)
+
+    def _record_persist_manifest(*, manifest: RunManifest, chapter_results: dict[str, ChapterResult]) -> None:
+        del manifest
+        persisted_manifest_snapshots.append(sorted(chapter_results.keys()))
+
+    monkeypatch.setattr(runner._store, "persist_chapter_artifacts", _record_persist_chapter)
+    monkeypatch.setattr(runner._store, "persist_manifest", _record_persist_manifest)
+
+    def _run_worker(*, task: ChapterTask, company_name: str) -> ChapterResult:
+        del company_name
+        if task.title == "C":
+            raise SceneAgentCreationError(scene_name="write", agent_label="写作 Agent")
+        return ChapterResult(
+            index=task.index,
+            title=task.title,
+            status="passed",
+            content=f"## {task.title}\n正文",
+            audit_passed=True,
+        )
+
+    monkeypatch.setattr(runner, "_run_middle_task_worker", _run_worker)
+
+    chapter_results: dict[str, ChapterResult] = {}
+    manifest = RunManifest(
+        version="write_manifest_v1",
+        signature="sig",
+        config=_build_test_write_config(tmp_path),
+        chapter_results={},
+    )
+
+    with pytest.raises(SceneAgentCreationError):
+        runner._run_middle_tasks_in_parallel(
+            middle_tasks=middle_tasks,
+            chapter_results=chapter_results,
+            manifest=manifest,
+            company_name="TestCo",
+        )
+
+    assert sorted(persisted_chapter_titles) == ["A", "B"]
+    assert "A" in chapter_results and "B" in chapter_results
+    assert "C" not in chapter_results
+    assert persisted_manifest_snapshots[-1] == ["A", "B"]
+
+
+@pytest.mark.unit
+def test_run_middle_tasks_in_parallel_drains_concurrent_successes_before_raise(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """验证 worker_limit>1 并发场景下，异常触发时同批/后续仍在跑的成功 future 也会被回收落盘。
+
+    场景：worker_limit=3，A/B/C 同批派发，C 立刻抛 SceneAgentCreationError；
+    A 与 B 在 C 抛异常后短暂 sleep 才返回成功。
+    若 except 路径不 drain in-flight future，A/B 的成功结果会被 executor 自然
+    跑完后丢弃，导致 manifest 无记录、resume 重跑——即 #41 reviewer 指出的并发漏洞。
+    """
+
+    runner = _build_runner(tmp_path)
+    monkeypatch.setattr(runner, "_resolve_middle_worker_limit", lambda: 3)
+
+    middle_tasks = [
+        ChapterTask(index=1, title="A", skeleton="## A"),
+        ChapterTask(index=2, title="B", skeleton="## B"),
+        ChapterTask(index=3, title="C", skeleton="## C"),
+    ]
+
+    persisted_chapter_titles: list[str] = []
+    persisted_manifest_snapshots: list[list[str]] = []
+
+    monkeypatch.setattr(
+        runner._store,
+        "persist_chapter_artifacts",
+        lambda result: persisted_chapter_titles.append(result.title),
+    )
+
+    def _record_persist_manifest(*, manifest: RunManifest, chapter_results: dict[str, ChapterResult]) -> None:
+        del manifest
+        persisted_manifest_snapshots.append(sorted(chapter_results.keys()))
+
+    monkeypatch.setattr(runner._store, "persist_manifest", _record_persist_manifest)
+
+    def _run_worker(*, task: ChapterTask, company_name: str) -> ChapterResult:
+        del company_name
+        if task.title == "C":
+            raise SceneAgentCreationError(scene_name="write", agent_label="写作 Agent")
+        # A/B 故意延后返回，确保主循环先在 C 上抛异常进入 except 路径
+        time.sleep(0.1)
+        return ChapterResult(
+            index=task.index,
+            title=task.title,
+            status="passed",
+            content=f"## {task.title}\n正文",
+            audit_passed=True,
+        )
+
+    monkeypatch.setattr(runner, "_run_middle_task_worker", _run_worker)
+
+    chapter_results: dict[str, ChapterResult] = {}
+    manifest = RunManifest(
+        version="write_manifest_v1",
+        signature="sig",
+        config=_build_test_write_config(tmp_path),
+        chapter_results={},
+    )
+
+    with pytest.raises(SceneAgentCreationError):
+        runner._run_middle_tasks_in_parallel(
+            middle_tasks=middle_tasks,
+            chapter_results=chapter_results,
+            manifest=manifest,
+            company_name="TestCo",
+        )
+
+    assert sorted(persisted_chapter_titles) == ["A", "B"]
+    assert sorted(chapter_results.keys()) == ["A", "B"]
+    assert persisted_manifest_snapshots[-1] == ["A", "B"]
+
+
+@pytest.mark.unit
+def test_run_middle_tasks_in_parallel_swallows_persist_failure_in_exception_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """验证异常路径下二次落盘失败被吞掉，不会掩盖原始 SceneAgentCreationError。"""
+
+    runner = _build_runner(tmp_path)
+    monkeypatch.setattr(runner, "_resolve_middle_worker_limit", lambda: 1)
+
+    middle_tasks = [
+        ChapterTask(index=1, title="A", skeleton="## A"),
+        ChapterTask(index=2, title="B", skeleton="## B"),
+    ]
+
+    def _explode_persist_chapter(_result: ChapterResult) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runner._store, "persist_chapter_artifacts", _explode_persist_chapter)
+    monkeypatch.setattr(
+        runner._store,
+        "persist_manifest",
+        lambda **_: None,
+    )
+
+    def _run_worker(*, task: ChapterTask, company_name: str) -> ChapterResult:
+        del company_name
+        if task.title == "B":
+            raise SceneAgentCreationError(scene_name="write", agent_label="写作 Agent")
+        return ChapterResult(
+            index=task.index,
+            title=task.title,
+            status="passed",
+            content=f"## {task.title}\n正文",
+            audit_passed=True,
+        )
+
+    monkeypatch.setattr(runner, "_run_middle_task_worker", _run_worker)
+
+    manifest = RunManifest(
+        version="write_manifest_v1",
+        signature="sig",
+        config=_build_test_write_config(tmp_path),
+        chapter_results={},
+    )
+
+    with pytest.raises(SceneAgentCreationError, match="写作 Agent 创建失败"):
+        runner._run_middle_tasks_in_parallel(
+            middle_tasks=middle_tasks,
+            chapter_results={},
+            manifest=manifest,
+            company_name="TestCo",
+        )
 
 
 @pytest.mark.unit
