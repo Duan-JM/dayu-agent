@@ -55,45 +55,6 @@ jobs:
         with:
           files: ${{ env.WHEEL_PATH }}
 
-  build-offline-linux-x64:
-    name: build-offline linux-x64 (py3.11)
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install locked dependencies
-        uses: ./.github/actions/install-locked-env
-        with:
-          constraints-path: constraints/lock-linux-x64-py311.txt
-
-      - name: Build and smoke test offline bundle
-        id: build_offline_bundle
-        uses: ./.github/actions/build-and-smoke-offline-bundle
-        with:
-          constraints-path: constraints/lock-linux-x64-py311.txt
-          platform-id: linux-x64
-
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: offline-linux-x64
-          path: ${{ steps.build_offline_bundle.outputs.bundle_path }}
-
-      - name: Upload release asset
-        if: github.event_name == 'release'
-        # v2
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
-        with:
-          files: ${{ steps.build_offline_bundle.outputs.bundle_path }}
-
   build-offline-windows-x64:
     name: build-offline windows-x64 (py3.11)
     runs-on: windows-latest

@@ -288,7 +288,6 @@ push 后 PR 自动更新，CI 重新跑。最终 merge 时用 **Squash and merge
 5. `release`
    - `Release Offline Bundles`
      - `build-wheel`
-     - `build-offline linux-x64`
      - `build-offline windows-x64`
      - `build-offline macos-arm64`
      - `build-offline macos-x64`
@@ -347,7 +346,7 @@ git push lan main
 
 放进 cron 或者每次 PR merge 后顺手做一次都行。
 
-### 7. PR 前做四平台安装包验证
+### 7. PR 前做三平台离线安装包验证
 
 在向 GitHub 提 PR 前，除了本地 `pyright`、受影响测试和常规命令 smoke 外，还要补一轮**离线安装包验证**。
 
@@ -355,8 +354,9 @@ git push lan main
 
 - `macos-arm64`：在当前本机直接构建并验证
 - `macos-x64`：在 Intel macOS 宿主机验证
-- `linux-x64`：在 Docker 容器中验证
 - `windows-x64`：在 Windows x64 宿主机验证
+
+Linux 仍保留在线安装、源码安装、锁文件 smoke 与 CI 平台验证；但 Linux 离线包体积超过 GitHub Release 资产承载能力，当前不作为正式发布资产，也不写入用户安装文档。
 
 这里有一个前提要明确：
 
@@ -373,7 +373,7 @@ git push lan main
 
 1. 构建项目 wheel
 2. 基于对应平台的 `constraints/lock-<platform>-py311.txt` 构建离线安装包
-3. 运行 [utils/smoke_test_offline_bundle.py](</Users/leo/workspace/dayu-agent/utils/smoke_test_offline_bundle.py>) 做干净虚拟环境 smoke
+3. 运行 [utils/smoke_test_offline_bundle.py](</Users/leo/workspace/dayu-agent/utils/smoke_test_offline_bundle.py>) 做干净虚拟环境 smoke，覆盖 `dayu-cli` / `dayu-wechat` / `dayu-render`
 
 示例中的 `dist/offline` 可以按需替换成别的输出目录。
 
@@ -594,16 +594,15 @@ pip install -e ".[test,dev,browser,web]" -c constraints/lock-windows-x64-py311.t
 
 #### 什么时候可以放心开 PR
 
-理想情况是四个平台都先人工验证一遍，再开 PR。
+理想情况是三个发布离线包平台都先人工验证一遍，再开 PR。
 
 如果时间有限，最低建议是：
 
 - 当前开发机先验证 `macos-arm64`
-- Docker 再验证 `linux-x64`
 - `windows-x64` 至少确认对应宿主机流程可跑，剩余收口交给 GitHub Actions
 - `macos-x64` 如需提前验证，需要在 Intel macOS 宿主机手工完成；正式 Release 会继续构建并上传该平台离线包
 
-如果 PR 的改动直接触及离线打包、安装脚本、平台差异依赖或 CLI 入口，则尽量不要跳过任何平台。
+如果 PR 的改动直接触及离线打包、安装脚本、平台差异依赖或 CLI 入口，则尽量不要跳过任何发布离线包平台。
 
 ### 8. 发布 release tag（按需）
 
@@ -619,11 +618,12 @@ pip install -e ".[test,dev,browser,web]" -c constraints/lock-windows-x64-py311.t
 
 - 一个在线安装用的通用 wheel：
   - `dayu_agent-<version>-py3-none-any.whl`
-- 4 个平台离线安装包：
+- 3 个平台离线安装包：
   - `dayu-agent-<version>-macos-arm64-offline.tar.gz`
   - `dayu-agent-<version>-macos-x64-offline.tar.gz`
-  - `dayu-agent-<version>-linux-x64-offline.tar.gz`
   - `dayu-agent-<version>-windows-x64-offline.zip`
+
+Linux 离线包体积超过 GitHub Release 资产承载能力，当前不作为正式发布资产；Linux 用户使用在线 wheel 安装或源码安装。
 
 这些资产由 `.github/workflows/release-offline.yml` 在 **GitHub Release 发布后** 自动生成并上传。
 
@@ -631,7 +631,7 @@ pip install -e ".[test,dev,browser,web]" -c constraints/lock-windows-x64-py311.t
 
 ##### 交给Agent做准备工作
 ```text
-我准备draft release一个 v0.1.3，帮我检查v0.1.2以来的PR。
+我准备draft release一个 v0.1.4，帮我检查 01e1398811d32ae7a19785365cf52aa67bee75a8 以来的 PR。
 - 完善 @CHANGELOG.md  ，贡献者 mention。
 - 根据 @docs/github_main_workflow.md   【### 8. 发布 release tag（按需）】中的【##### 第 1 步：在功能分支里准备版本发布改动】，修改pyproject.toml 和 根目录 README.md
 - 修改 @docs/github_main_workflow.md  【### 8. 发布 release tag（按需）】中的 【##### 第 2 步：同步主线并打 tag】中的命令。
@@ -656,10 +656,10 @@ pip install -e ".[test,dev,browser,web]" -c constraints/lock-windows-x64-py311.t
 
 ```bash
 git switch main
-git pull
-git tag -a v0.1.3 -m "v0.1.3 — 离线安装支持四平台；支持 Ollama / 自定义模型；interactive 会话复用；写作流水线优化"
-git push github v0.1.3
-git push lan v0.1.3
+git pull --ff-only github main
+git tag -a v0.1.4 -m "v0.1.4 — A 股 / 港股财报下载；Web 交互式分析"
+git push github v0.1.4
+git push lan v0.1.4
 ```
 
 ##### 第 3 步：创建 GitHub Release
@@ -667,77 +667,68 @@ git push lan v0.1.3
 推荐用 `gh`，也可以直接在 GitHub 网页操作。
 
 ```bash
-gh release create v0.1.3 \
-  --title "v0.1.3 — 离线安装支持四平台；支持 Ollama / 自定义模型；interactive 会话复用；写作流水线优化" \
+gh release create v0.1.4 \
+  --draft \
+  --title "v0.1.4 — A 股 / 港股财报下载；Web 交互式分析" \
   --notes "$(cat <<'EOF'
 ## 安装
 
 ```bash
-pip install https://github.com/noho/dayu-agent/releases/download/v0.1.3/dayu_agent-0.1.3-py3-none-any.whl
+pip install https://github.com/noho/dayu-agent/releases/download/v0.1.4/dayu_agent-0.1.4-py3-none-any.whl
 ```
 
 ## 更新到新版本
 
 ```bash
-pip install --upgrade https://github.com/noho/dayu-agent/releases/download/v0.1.3/dayu_agent-0.1.3-py3-none-any.whl
+pip install --upgrade https://github.com/noho/dayu-agent/releases/download/v0.1.4/dayu_agent-0.1.4-py3-none-any.whl
 ```
 
 ## 离线安装
 
 从 [Releases](https://github.com/noho/dayu-agent/releases) 页面下载对应平台的离线安装包：
 
-- Mac ARM芯片：`dayu-agent-0.1.3-macos-arm64-offline.tar.gz`
-- Mac Intel芯片：`dayu-agent-0.1.3-macos-x64-offline.tar.gz`
-- Linux：`dayu-agent-0.1.3-linux-x64-offline.tar.gz`
-- Windows：`dayu-agent-0.1.3-windows-x64-offline.zip`
+- Mac ARM芯片：`dayu-agent-0.1.4-macos-arm64-offline.tar.gz`
+- Mac Intel芯片：`dayu-agent-0.1.4-macos-x64-offline.tar.gz`
+- Windows：`dayu-agent-0.1.4-windows-x64-offline.zip`
+
+Linux 用户请使用上面的在线 wheel 安装或源码安装。
+
+### 注意
+
+如果你从 v0.1.3 升级：
+- 本次更新后需运行一次 `dayu-cli init` ，已下载/上传的财报不会丢失，已生成的报告不会丢失。
+
+如果你从更早版本升级：
+- 本次更新后需运行一次 `dayu-cli init --reset` ，已下载/上传的财报不会丢失，已生成的报告不会丢失。
 
 ## 本次更新
 
-- 本次更新后需运行一次 `dayu-cli init --reset` ，已下载/上传的财报不会丢失，已生成的报告不会丢失。
-
 **新功能**
 
-- 离线安装包支持 4 个平台（macOS ARM64 / x64、Linux x64、Windows x64），新增 macOS Intel (x64)
-- 支持 Gemini 模型，通过运行`dayu-cli init`选择。
-- 支持本地 Ollama 上运行的模型，通过运行`dayu-cli init`选择。
-- 支持自定义 OpenAI 兼容模型（如 OpenRouter），通过运行`dayu-cli init`选择。
-- Agent 执行进度感知：CLI 交互模式下实时显示当前执行的工具名和关键参数。(@deanbear ： 观察 agent 努力也是一种参与感)
-- prompt / interactive 的 --label 恢复语义
-  - prompt 无 --label：保留 one-shot 语义，不支持恢复上下文。
-  - prompt --label <label>：每次相同`label`的 prompt 都共用相同聊天记录，**适合在OpenClaw中使用**。
-  - interactive 无 --label：恢复上次相同聊天记录的交互式对话。
-  - interactive --label <label>：每次相同`label`的 interactive 都是相同聊天记录的交互式对话。
-- `dayu-cli init --reset` 一键重置工作区配置
-- 埋入web支持，下个版本见。
+- 支持从巨潮下载 A 股财报，并完成 PDF 下载、Docling JSON 导出、断点恢复、元数据提交与本地重建。
+- 支持从披露易下载港股财报，覆盖年报、半年报与独立季度业绩公告；缺失的独立季度报告会按 skipped 收口。
+- Web UI 支持交互式分析：按 ticker 绑定稳定会话、流式展示回答，并支持清空历史。
 
 **优化**
 
-- 针对财报分析优化的全新多轮会话记忆子系统。
-- 优化写作流水线，提高成功率。
-- 优化CLI输出。
-
-**模型升级**
-
-- 小米 MiMo 升级到 v2.5 Pro
-- DeepSeek 升级到 V4
-- 通义千问升级到 qwen3.6-plus
+- 美股、A 股、港股下载使用独立并发 lane，避免不同市场的长下载任务互相占用许可。
+- A 股 / 港股下载过程补充更完整的日志、候选过滤、年度/期间去重、覆盖下载和中断恢复能力。
+- ticker 归一化继续收敛跨市场写法，保护交易所后缀 alias，并统一美股 class share 分隔符。
 
 **修复与改进**
 
-- 兼容 Gemini 和 Qwen 非标协议行为。
-- 剥离本地小模型输出的 Markdown 代码围栏，修复 prompt/interactive 显示问题。
-- 修复 write 流水线并发治理，消除本地模型下的 permit 超时。
-- 修复 Windows 上传、docling 后端排序等平台兼容问题。
-- SSE tool call 兼容 Gemini / Qwen 非标协议行为
+- 修复 A 股覆盖下载、运行时防护和 A 股 / 港股独立季度处理问题。
+- 修复 Web 交互式分析中的重复事件消费、历史加载、清空历史和异常收口问题。
 
 安装后可用命令：
 - `dayu-cli init` — 初始化配置
 - `dayu-cli` — 财报分析 CLI
+- `dayu-web` — Web UI
 - `dayu-wechat` — WeChat 服务
 - `dayu-render` — 报告渲染
 
-感谢以下贡献者参与本次发布（按字母序）：
-@deanbear、@Leo Liu (noho)、@xingren23、@Zx55
+感谢以下贡献者参与本次发布（按 GitHub 用户名排序）：
+@noho、@xingren23
 EOF
 )"
 ```
@@ -745,21 +736,20 @@ EOF
 说明：
 
 - 不需要在本地手工构建 wheel 或上传文件。
-- `gh release create` 完成后，GitHub 会触发 `Release Offline Bundles` workflow。
+- `gh release create --draft` 只创建草稿，不会触发 `Release Offline Bundles` workflow；确认草稿内容后，在 GitHub 网页点击 **Publish release** 才会触发正式发布构建。
 - 该 workflow 会自动执行两类发布任务：
   - 在单独的 wheel job 中构建通用 `py3-none-any` wheel，并上传到当前 Release
-  - 在 4 个平台上分别构建离线安装包、执行 smoke test，并上传到当前 Release
+  - 在 3 个平台上分别构建离线安装包、执行 smoke test，并上传到当前 Release
 
-##### 第 4 步：等待 Release workflow 完成
+##### 第 4 步：发布草稿并等待 Release workflow 完成
 
-到 GitHub Actions 查看 `Release Offline Bundles` 是否全部成功。
+确认草稿内容无误并点击 **Publish release** 后，到 GitHub Actions 查看 `Release Offline Bundles` 是否全部成功。
 
-只有当它全部成功后，这次 release 才算真正完成。最终 Release 页面应看到这 5 个资产：
+只有当它全部成功后，这次 release 才算真正完成。最终 Release 页面应看到这 4 个资产：
 
 - `dayu_agent-<version>-py3-none-any.whl`
 - `dayu-agent-<version>-macos-arm64-offline.tar.gz`
 - `dayu-agent-<version>-macos-x64-offline.tar.gz`
-- `dayu-agent-<version>-linux-x64-offline.tar.gz`
 - `dayu-agent-<version>-windows-x64-offline.zip`
 
 如果只是想手工试跑发布流程而不污染正式 Release，可以手动触发 `workflow_dispatch`。  

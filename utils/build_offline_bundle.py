@@ -19,6 +19,41 @@ from typing import Mapping, Sequence
 
 _SOURCE_DISTRIBUTION_SUFFIXES: tuple[str, ...] = (".tar.gz", ".zip", ".tar.bz2", ".tar.xz", ".tgz")
 _PIP_ONLY_BINARY_ALL = "--only-binary=:all:"
+_OFFLINE_PACKAGE_EXTRAS: tuple[str, ...] = ("browser", "web")
+
+
+def _offline_package_spec(version: str) -> str:
+    """生成离线安装脚本使用的项目包规格。
+
+    参数：
+        version：项目版本号。
+
+    返回值：
+        str：带离线包必需 extras 的项目包规格。
+
+    异常：
+        无。
+    """
+
+    extras = ",".join(_OFFLINE_PACKAGE_EXTRAS)
+    return f"dayu-agent[{extras}]=={version}"
+
+
+def _offline_wheel_requirement(wheel_path: Path) -> str:
+    """生成 wheelhouse 下载阶段使用的项目 wheel requirement。
+
+    参数：
+        wheel_path：项目 wheel 路径。
+
+    返回值：
+        str：带离线包必需 extras 的 PEP 508 wheel requirement。
+
+    异常：
+        无。
+    """
+
+    extras = ",".join(_OFFLINE_PACKAGE_EXTRAS)
+    return f"dayu-agent[{extras}] @ {wheel_path.resolve().as_uri()}"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -213,7 +248,7 @@ def _write_install_script(bundle_dir: Path, *, version: str, platform_id: str) -
         OSError：文件写入失败时抛出。
     """
 
-    package_spec = f"dayu-agent[browser]=={version}"
+    package_spec = _offline_package_spec(version)
     if platform_id.startswith("windows-"):
         script_path = bundle_dir / "install.cmd"
         script_text = (
@@ -395,7 +430,7 @@ def _download_wheelhouse(
     with tempfile.TemporaryDirectory(prefix="dayu-offline-build-") as temp_dir_name:
         requirements_path = Path(temp_dir_name) / "requirements.txt"
         requirements_path.write_text(
-            f"dayu-agent[browser] @ {wheel_path.resolve().as_uri()}\n",
+            f"{_offline_wheel_requirement(wheel_path)}\n",
             encoding="utf-8",
         )
         pip_download_command: list[str] = [

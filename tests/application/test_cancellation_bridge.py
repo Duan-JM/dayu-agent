@@ -75,6 +75,23 @@ def _wait_until(predicate: Callable[[], bool], timeout_seconds: float, interval_
     return predicate()
 
 
+def _bridge_thread_stopped(bridge: CancellationBridge) -> bool:
+    """判断取消桥接线程是否已经停止。
+
+    Args:
+        bridge: 被检查的 ``CancellationBridge`` 实例。
+
+    Returns:
+        线程不存在或已退出时返回 ``True``，否则返回 ``False``。
+
+    Raises:
+        无。
+    """
+
+    thread = bridge._thread
+    return thread is None or not thread.is_alive()
+
+
 class TestCancellationBridgePolling:
     """CancellationBridge 轮询行为测试。"""
 
@@ -114,12 +131,10 @@ class TestCancellationBridgePolling:
         bridge.start()
 
         mock_registry._state = RunState.SUCCEEDED
-        time.sleep(0.2)
 
         # token 不应被取消
+        assert _wait_until(lambda: _bridge_thread_stopped(bridge), timeout_seconds=1.0)
         assert not token.is_cancelled()
-        # 线程应已退出
-        assert bridge._thread is None or not bridge._thread.is_alive()
         bridge.stop()
 
     @pytest.mark.unit
@@ -136,8 +151,8 @@ class TestCancellationBridgePolling:
         bridge.start()
 
         mock_registry._deleted = True
-        time.sleep(0.2)
 
+        assert _wait_until(lambda: _bridge_thread_stopped(bridge), timeout_seconds=1.0)
         assert not token.is_cancelled()
         bridge.stop()
 

@@ -10,6 +10,40 @@
 
 -- 
 
+## [0.1.4] - 2026-05-03
+
+### 注意
+
+如果你从 v0.1.3 升级：
+- 本次更新后需运行一次 `dayu-cli init` ，已下载/上传的财报不会丢失，已生成的报告不会丢失。
+
+如果你从更早版本升级：
+- 本次更新后需运行一次 `dayu-cli init --reset` ，已下载/上传的财报不会丢失，已生成的报告不会丢失。
+
+### 新增
+
+- 支持从巨潮下载 A 股财报，并完成 PDF 下载、Docling JSON 导出、断点恢复、元数据提交与本地重建。
+- 支持从披露易下载港股财报，覆盖年报、半年报与独立季度业绩公告；缺失的独立季度报告会按 skipped 收口。
+- Web UI 支持交互式分析：按 ticker 绑定稳定会话、流式展示回答，并支持清空历史。
+
+### 优化
+
+- 美股、A 股、港股下载使用独立并发 lane，避免不同市场的长下载任务互相占用许可。
+- A 股 / 港股下载过程补充更完整的日志、候选过滤、年度/期间去重、覆盖下载和中断恢复能力。
+- ticker 归一化继续收敛跨市场写法，保护交易所后缀 alias，并统一美股 class share 分隔符。
+
+### 修复
+
+- 修复 A 股覆盖下载、运行时防护和 A 股 / 港股独立季度处理问题。
+- 修复 Web 交互式分析中的重复事件消费、历史加载、清空历史和异常收口问题。
+
+### 贡献者
+
+感谢以下贡献者参与本次发布（按 GitHub 用户名排序）：
+@noho、@xingren23
+
+--
+
 ## [0.1.3] - 2026-04-27
 
 ### 注意
@@ -18,7 +52,7 @@
 
 ### 新增
 
-- 离线安装包支持 4 个平台（macOS ARM64 / x64、Linux x64、Windows x64），新增 macOS Intel (x64)
+- 离线安装包支持 3 个平台（macOS ARM64 / x64、Windows x64），新增 macOS Intel (x64)；Linux 用户可继续使用在线安装或源码安装。
 - 支持 Gemini 模型，通过运行`dayu-cli init`选择。
 - 支持本地 Ollama 上运行的模型，通过运行`dayu-cli init`选择。
 - 支持自定义 OpenAI 兼容模型（如 OpenRouter），通过运行`dayu-cli init`选择。
@@ -62,7 +96,7 @@
 
 ### 新增
 
-- 提供离线安装包，覆盖 `macOS ARM64`、`Linux x64`、`Windows x64` 三个平台。
+- 提供离线安装包，覆盖 `macOS ARM64`、`Windows x64` 两个平台；Linux 用户可继续使用在线安装或源码安装。
 
 ### 变更
 
@@ -102,7 +136,8 @@
 - 财报电话会议音频转录后的问答区分未实现。
 - 定性分析模板对不同公司的差异化判断路径仍偏机械。
 
-[Unreleased]: https://github.com/noho/dayu-agent/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/noho/dayu-agent/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/noho/dayu-agent/releases/tag/v0.1.4
 [0.1.3]: https://github.com/noho/dayu-agent/releases/tag/v0.1.3
 [0.1.2]: https://github.com/noho/dayu-agent/releases/tag/v0.1.2
 [0.1.1]: https://github.com/noho/dayu-agent/releases/tag/v0.1.1

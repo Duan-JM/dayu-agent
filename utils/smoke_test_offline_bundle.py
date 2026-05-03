@@ -155,6 +155,9 @@ def _run_smoke_checks(python_path: Path, scripts_dir: Path) -> None:
     dayu_render = scripts_dir / ("dayu-render.exe" if os.name == "nt" else "dayu-render")
     _run_command([str(dayu_cli), "--help"])
     _run_command([str(dayu_wechat), "--help"])
+    # `dayu-web --help` 当前尚未完成，暂不作为离线包 smoke 阻塞项。
+    # dayu_web = scripts_dir / ("dayu-web.exe" if os.name == "nt" else "dayu-web")
+    # _run_command([str(dayu_web), "--help"])
     _run_command([str(dayu_render), "--help"])
     _run_command([str(dayu_cli), "init", "--help"])
 

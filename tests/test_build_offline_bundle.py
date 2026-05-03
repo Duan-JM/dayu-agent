@@ -22,7 +22,7 @@ class TestWriteInstallScript:
         script_text = (tmp_path / "install.sh").read_text(encoding="utf-8")
 
         assert module._PIP_ONLY_BINARY_ALL in script_text
-        assert "dayu-agent[browser]==0.1.2" in script_text
+        assert "dayu-agent[browser,web]==0.1.2" in script_text
 
     def test_writes_windows_install_script_with_binary_only_guard(self, tmp_path: Path) -> None:
         """Windows 安装脚本应显式要求仅安装 wheel。"""
@@ -32,7 +32,97 @@ class TestWriteInstallScript:
         script_text = (tmp_path / "install.cmd").read_text(encoding="utf-8")
 
         assert module._PIP_ONLY_BINARY_ALL in script_text
-        assert "dayu-agent[browser]==0.1.2" in script_text
+        assert "dayu-agent[browser,web]==0.1.2" in script_text
+
+
+class TestWriteBundleReadme:
+    """`_write_bundle_readme()` 测试。"""
+
+    def test_readme_does_not_mention_unfinished_dayu_web_help(self, tmp_path: Path) -> None:
+        """离线包 README 不应提示尚未完成的 Web help 验证。"""
+
+        module._write_bundle_readme(
+            tmp_path,
+            package_name="dayu-agent",
+            version="0.1.2",
+            platform_id="macos-arm64",
+        )
+
+        readme_text = (tmp_path / "README.txt").read_text(encoding="utf-8")
+
+        assert "dayu-web --help" not in readme_text
+
+
+class TestDownloadWheelhouse:
+    """`_download_wheelhouse()` 测试。"""
+
+    def test_requirements_include_browser_and_web_extras(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """wheelhouse 下载阶段应同时纳入 browser 与 web extras。"""
+
+        wheel_path = tmp_path / "dayu_agent-0.1.2-py3-none-any.whl"
+        wheel_path.write_text("wheel", encoding="utf-8")
+        constraints_path = tmp_path / "constraints.txt"
+        constraints_path.write_text("requests==2.32.5\n", encoding="utf-8")
+        captured_requirements: list[str] = []
+
+        def _fake_run_command(command: list[str], *, env: dict[str, str] | None = None) -> None:
+            """记录临时 requirements 文件内容。
+
+            Args:
+                command: 被测代码传入的 pip download 命令。
+                env: 可选环境变量覆盖。
+
+            Returns:
+                无。
+
+            Raises:
+                ValueError: 命令中缺少 `-r` 参数时由 `list.index` 抛出。
+                OSError: requirements 文件读取失败时抛出。
+            """
+
+            del env
+            requirements_path = Path(command[command.index("-r") + 1])
+            captured_requirements.append(requirements_path.read_text(encoding="utf-8"))
+
+        def _fake_build_source_distribution_wheels(
+            wheelhouse_dir: Path,
+            *,
+            wheel_cache_dir: Path | None,
+        ) -> None:
+            """跳过源码包构建。
+
+            Args:
+                wheelhouse_dir: 被测代码传入的 wheelhouse 目录。
+                wheel_cache_dir: 可选 wheel 缓存目录。
+
+            Returns:
+                无。
+
+            Raises:
+                无。
+            """
+
+            del wheelhouse_dir, wheel_cache_dir
+
+        monkeypatch.setattr(module, "_run_command", _fake_run_command)
+        monkeypatch.setattr(
+            module,
+            "_build_source_distribution_wheels",
+            _fake_build_source_distribution_wheels,
+        )
+
+        module._download_wheelhouse(
+            tmp_path / "bundle",
+            wheel_path=wheel_path,
+            constraints_path=constraints_path,
+            wheel_cache_dir=None,
+        )
+
+        assert captured_requirements == [f"{module._offline_wheel_requirement(wheel_path)}\n"]
 
 
 class TestBuildSourceDistributionWheels:

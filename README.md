@@ -27,7 +27,7 @@
   - 同一行业里，不同公司写出公司自己的特殊结构变量。
 - 位于 Engine 的 web tools 现在的对抗challenge能力很弱，很多网站无法访问。
 - **GUI 尚未实现**；
-- **Web UI 目前仍只有 FastAPI 骨架**。
+- **Web UI 已支持自选股、财报下载和交互式分析，仍处于早期阶段**。
 - **WeChat UI 仅支持文本消息首版，还可添加更多好玩的功能**。
 - 财报电话会议记录音频转录文字后信息提取（起码要区分信息来自提问还是回答）尚未实现。
 - 财报presentation信息提取尚未实现。
@@ -58,7 +58,7 @@ python -m pip install https://github.com/noho/dayu-agent/releases/download/<vers
 示例（替换为最新版本号）：
 
 ```bash
-python -m pip install https://github.com/noho/dayu-agent/releases/download/v0.1.3/dayu_agent-0.1.3-py3-none-any.whl
+python -m pip install https://github.com/noho/dayu-agent/releases/download/v0.1.4/dayu_agent-0.1.4-py3-none-any.whl
 ```
 
 这种方式最轻，但安装耗时和成功率会受网络、平台和上游依赖发布状态影响。最新稳定版请以 [Releases](https://github.com/noho/dayu-agent/releases) 页面为准，复制对应版本的 wheel URL。
@@ -95,23 +95,23 @@ uv tool list --show-version-specifiers --show-python
 
 - Mac ARM芯片：`dayu-agent-<version>-macos-arm64-offline.tar.gz`
 - Mac Intel芯片：`dayu-agent-<version>-macos-x64-offline.tar.gz`
-- Linux：`dayu-agent-<version>-linux-x64-offline.tar.gz`
 - Windows：`dayu-agent-<version>-windows-x64-offline.zip`
 
+Linux 用户请使用在线 wheel 安装或源码安装；当前不发布 Linux 离线安装包。
 
-macOS / Linux 示例：
+macOS 示例：
 
 ```bash
-tar -xzf dayu-agent-0.1.3-macos-arm64-offline.tar.gz
-cd dayu-agent-0.1.3-macos-arm64-offline
+tar -xzf dayu-agent-0.1.4-macos-arm64-offline.tar.gz
+cd dayu-agent-0.1.4-macos-arm64-offline
 ./install.sh
 ```
 
 Windows PowerShell 示例：
 
 ```powershell
-Expand-Archive .\dayu-agent-0.1.3-windows-x64-offline.zip -DestinationPath .
-cd .\dayu-agent-0.1.3-windows-x64-offline
+Expand-Archive .\dayu-agent-0.1.4-windows-x64-offline.zip -DestinationPath .
+cd .\dayu-agent-0.1.4-windows-x64-offline
 .\install.cmd
 ```
 #### 1.1.3 clone 源代码安装
@@ -309,7 +309,7 @@ dayu-cli <subcommand> [参数]
 
 ### 2.2 Web 入口（Streamlit）
 
-基于 Streamlit 的 Web UI：
+基于 Streamlit 的 Web UI，可在浏览器中管理自选股、下载财报并进行按 ticker 绑定历史的交互式分析：
 
 ```bash
 dayu-web

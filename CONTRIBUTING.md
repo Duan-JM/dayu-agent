@@ -17,9 +17,12 @@
 
 - 先从第一性原理说明问题和目标，不要直接沿用历史实现假设。
 - root cause 必须与逻辑或数据同源，禁止用间接证据拼结论。
-- 严格遵守分层边界：UI、Application、Runtime、Services、Engine、Capability、Fins 的职责不要混写。
-- 对财报文档的读写只通过 `FsDocumentRepository` / `DocumentRepository`。
-- 禁止把显式参数塞进 `extra_payload`。
+- Dayu 的架构定位是：宿主强约束下的 `LLM in the loop`，不是 `LLM on the loop`。
+- Host 对 Agent / AsyncAgent / AsyncOpenAIRunner 的生命周期、取消、治理是强约束真源。
+- 严格遵守分层架构：`UI -> Service -> Host -> Agent`。
+- 禁止反向依赖。
+- 设计下层组件接口时，必须假设上层组件不存在，只考虑上层调用需求，不向上泄漏实现细节。
+- 财报文档存取必须且只能通过 `dayu.fins.storage` 下的仓储协议与仓储实现完成。
 - 写作链路优化目标是写出更好的买方分析报告，而不是为了更容易通过 audit。
 
 ## 开发流程
@@ -64,9 +67,9 @@ mypy dayu
   - 同一章节里，不同行业公司写出明显不同的判断路径。
   - 同一行业里，不同公司写出公司自己的特殊结构变量。
 - 位于 Engine 的 web tools 现在的对抗challenge能力很弱，很多网站无法访问。
-- 位于 Fins 的港股、A股财报下载功能尚未实现。
-- GUI 尚未实现；Web UI 目前仍只有 FastAPI 骨架。
-- WeChat UI 仅支持文本消息首版，还可添加更多好玩的功能。
+- **GUI 尚未实现**；
+- **Web UI 已支持自选股、财报下载和交互式分析，仍处于早期阶段**。
+- **WeChat UI 仅支持文本消息首版，还可添加更多好玩的功能**。
 - 财报电话会议记录音频转录文字后信息提取（起码要区分信息来自提问还是回答）尚未实现。
 - 财报presentation信息提取尚未实现。
 - 欢迎围绕以下方向提交 issue 或 PR：
