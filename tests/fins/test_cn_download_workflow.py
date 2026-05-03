@@ -55,6 +55,8 @@ class _FakeDiscoveryClient:
     pdf_bytes: bytes = _PDF_BYTES
     download_calls: int = 0
     failed_source_ids: set[str] = field(default_factory=set)
+    list_error: RuntimeError | None = None
+    delete_pdf_before_return: bool = False
 
     def resolve_company(self, query: CnReportQuery) -> CnCompanyProfile:
         """返回固定公司元数据。"""
@@ -74,6 +76,8 @@ class _FakeDiscoveryClient:
         """返回测试候选。"""
 
         del query, profile
+        if self.list_error is not None:
+            raise self.list_error
         return self.candidates
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
@@ -84,6 +88,8 @@ class _FakeDiscoveryClient:
             raise RuntimeError(f"download failed: {candidate.source_id}")
         path = self.temp_dir / f"{candidate.source_id}_{self.download_calls}.pdf"
         path.write_bytes(self.pdf_bytes)
+        if self.delete_pdf_before_return:
+            path.unlink()
         return DownloadedReportAsset(
             candidate=candidate,
             pdf_path=path,
@@ -466,7 +472,7 @@ def test_cn_download_candidate_failure_does_not_fail_pipeline(tmp_path: Path) ->
 
 
 def test_cn_download_workflow_keeps_multi_year_periodic_candidates(tmp_path: Path) -> None:
-    """workflow 不应再次截断 downloader 返回的跨年 H1/Q1/Q3 候选。"""
+    """workflow 不应再次截断 downloader 返回的跨年 H1/季度候选。"""
 
     discovery = _FakeDiscoveryClient(
         temp_dir=tmp_path,
@@ -488,6 +494,30 @@ def test_cn_download_workflow_keeps_multi_year_periodic_candidates(tmp_path: Pat
     assert summary["downloaded"] == 2
     assert discovery.download_calls == 2
     assert converter.calls == 2
+
+
+def test_cn_download_workflow_marks_missing_independent_quarters_skipped(tmp_path: Path) -> None:
+    """请求 Q2/Q4 但主源无独立报告时应 skipped，不应 failed 或用 H1/FY 冒充。"""
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=())
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
+
+    events = _collect_events(pipeline, form_type="Q2 Q4")
+
+    completed = [event for event in events if event.event_type == DownloadEventType.FILING_COMPLETED]
+    result = _final_result(events)
+    summary = result["summary"]
+    assert isinstance(summary, dict)
+    assert [(event.payload["form_type"], event.payload["status"]) for event in completed] == [
+        ("Q2", "skipped"),
+        ("Q4", "skipped"),
+    ]
+    assert result["status"] == "ok"
+    assert summary["skipped"] == 2
+    assert summary["failed"] == 0
+    assert discovery.download_calls == 0
+    assert converter.calls == 0
 
 
 def test_cn_download_default_window_limits_interim_to_two_years(tmp_path: Path) -> None:
@@ -655,6 +685,33 @@ def test_cn_download_stage_cancel_returns_cancelled_not_failed(tmp_path: Path) -
     assert summary["failed"] == 0
     assert any(event.event_type == DownloadEventType.FILE_DOWNLOADED for event in events)
     assert not any(event.event_type == DownloadEventType.FILING_FAILED for event in events)
+
+
+def test_cn_download_cancel_after_docling_convert_prevents_commit(tmp_path: Path) -> None:
+    """Docling 转换后收到取消信号时不得继续提交完成态 source meta。"""
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
+
+    def cancel_checker() -> bool:
+        """转换完成后返回取消。"""
+
+        return converter.calls > 0
+
+    events = _collect_events(pipeline, cancel_checker=cancel_checker)
+
+    result = _final_result(events)
+    document_id = build_cn_filing_ids(
+        ticker="600519",
+        form_type="FY",
+        fiscal_year=2024,
+        fiscal_period="FY",
+        amended=False,
+    )[0]
+    source_meta = pipeline._source_repository.get_source_meta("600519", document_id, SourceKind.FILING)  # type: ignore[attr-defined]
+    assert result["status"] == "cancelled"
+    assert source_meta["ingest_complete"] is False
 
 
 def test_cn_download_commits_when_pdf_and_docling_are_staged(tmp_path: Path) -> None:
@@ -825,6 +882,64 @@ def test_cn_download_overwrite_clears_ticker_and_redownloads(tmp_path: Path) -> 
     assert str(meta["primary_document"]).endswith("_docling.json")
 
 
+def test_cn_download_overwrite_does_not_clear_when_discovery_fails(tmp_path: Path) -> None:
+    """overwrite=True 遇到候选发现失败时不得先清空本地已完成 filing。"""
+
+    context = build_fs_storage_test_context(tmp_path)
+    maintenance = _CountingMaintenanceRepository(context.filing_maintenance_repository)
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    converter = _FakeConverter()
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        processor_registry=ProcessorRegistry(),
+        company_repository=context.company_repository,
+        source_repository=context.source_repository,
+        processed_repository=context.processed_repository,
+        blob_repository=context.blob_repository,
+        filing_maintenance_repository=maintenance,
+        cn_discovery_client=discovery,
+        convert_pdf_to_docling_json=converter,
+    )
+    _collect_events(pipeline)
+    document_id = build_cn_filing_ids(
+        ticker="600519",
+        form_type="FY",
+        fiscal_year=2024,
+        fiscal_period="FY",
+        amended=False,
+    )[0]
+    assert context.source_repository.get_source_meta("600519", document_id, SourceKind.FILING)
+
+    discovery.list_error = RuntimeError("remote discovery unavailable")
+    events = _collect_events(pipeline, overwrite=True)
+
+    result = _final_result(events)
+    assert result["status"] == "failed"
+    assert maintenance.cleared_tickers == []
+    assert context.source_repository.get_source_meta("600519", document_id, SourceKind.FILING)
+
+
+def test_cn_download_pdf_temp_file_read_failure_is_filing_failed(tmp_path: Path) -> None:
+    """PDF 下载后临时文件不可读时应产出 filing failed，而不是未处理异常。"""
+
+    discovery = _FakeDiscoveryClient(
+        temp_dir=tmp_path,
+        candidates=(_candidate(),),
+        delete_pdf_before_return=True,
+    )
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
+
+    events = _collect_events(pipeline)
+
+    failed_events = [event for event in events if event.event_type == DownloadEventType.FILING_FAILED]
+    result = _final_result(events)
+    summary = result["summary"]
+    assert isinstance(summary, dict)
+    assert failed_events[-1].payload["reason_code"] == "pdf_read_failed"
+    assert summary["failed"] == 1
+
+
 def test_cn_download_unsupported_ticker_raises_value_error(tmp_path: Path) -> None:
     """非 CN/HK ticker 应与 SEC 一样作为请求级错误直接抛出。"""
 
@@ -897,3 +1012,68 @@ def test_cn_download_rebuild_local_meta_manifest_without_redownload(tmp_path: Pa
     assert rebuilt_meta["download_version"] == CN_PIPELINE_DOWNLOAD_VERSION
     assert rebuilt_meta["staging_remote_fingerprint"] is None
     assert rebuilt_meta["staging_pdf_sha256"] is None
+
+
+def test_cn_download_rebuild_honors_cancel_checker(tmp_path: Path) -> None:
+    """rebuild 遍历本地 filing 时应响应取消并返回 cancelled。"""
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
+    _collect_events(pipeline)
+
+    async def collect() -> list[DownloadEvent]:
+        events: list[DownloadEvent] = []
+        async for event in pipeline.download_stream(
+            ticker="600519",
+            form_type="FY",
+            start_date="2024",
+            end_date="2026",
+            overwrite=False,
+            rebuild=True,
+            cancel_checker=lambda: True,
+        ):
+            events.append(event)
+        return events
+
+    events = asyncio.run(collect())
+
+    result = _final_result(events)
+    assert [event.event_type for event in events] == [
+        DownloadEventType.PIPELINE_STARTED,
+        DownloadEventType.PIPELINE_COMPLETED,
+    ]
+    assert result["status"] == "cancelled"
+
+
+def test_cn_download_post_loop_cancel_checker_error_yields_failed_result(tmp_path: Path) -> None:
+    """最终状态检查时 cancel_checker 失败也必须产出 PIPELINE_COMPLETED。"""
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=())
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
+
+    async def collect() -> list[DownloadEvent]:
+        events: list[DownloadEvent] = []
+
+        def cancel_checker() -> bool:
+            """模拟取消通道关闭。"""
+
+            raise RuntimeError("cancel channel closed")
+
+        async for event in pipeline.download_stream(
+            ticker="600519",
+            form_type="FY",
+            start_date="2024",
+            end_date="2026",
+            cancel_checker=cancel_checker,
+        ):
+            events.append(event)
+        return events
+
+    events = asyncio.run(collect())
+
+    result = _final_result(events)
+    assert events[-1].event_type == DownloadEventType.PIPELINE_COMPLETED
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "cn_download_failed"

@@ -373,6 +373,36 @@ def test_list_report_candidates_filters_blocklisted_titles() -> None:
     assert only.etag == '"abc"'
 
 
+def test_list_report_candidates_returns_empty_for_cninfo_independent_q2_q4() -> None:
+    """巨潮没有稳定独立 Q2/Q4 分类时应返回空候选，不用 H1/FY 冒充。"""
+
+    query = CnReportQuery(
+        market="CN",
+        normalized_ticker="002594",
+        start_date="2024-01-01",
+        end_date="2025-12-31",
+        target_periods=("Q2", "Q4"),
+    )
+    query_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal query_calls
+        url_str = str(request.url)
+        if url_str == CNINFO_STOCK_JSON_URL:
+            return _stock_mapping_response()
+        if url_str == CNINFO_QUERY_URL:
+            query_calls += 1
+            return httpx.Response(200, json={"announcements": [], "hasMore": False})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _build_client(handler)
+    profile = client.resolve_company(query)
+    candidates = client.list_report_candidates(query, profile)
+
+    assert candidates == ()
+    assert query_calls == 0
+
+
 def test_list_report_candidates_prefers_a_share_fy_over_later_h_share_notice() -> None:
     """688981 年报候选应排除更晚披露的港股公告，选择 A 股年度报告。"""
 
@@ -431,6 +461,74 @@ def test_list_report_candidates_prefers_a_share_fy_over_later_h_share_notice() -
     candidates = client.list_report_candidates(query, profile)
 
     assert [candidate.source_id for candidate in candidates] == ["A1"]
+
+
+def test_list_report_candidates_raises_on_failed_period_query() -> None:
+    """单个巨潮公告分类失败也必须抛错，不能伪装成该财期缺报告。"""
+
+    h1_payload = {
+        "announcements": [
+            _build_announcement(
+                announcement_id="H1",
+                title="比亚迪：2024年半年度报告",
+                announcement_date="2024-08-30",
+                adjunct_url="finalpage/2024-08-30/h1.PDF",
+            ),
+        ],
+        "hasMore": False,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if url_str == CNINFO_STOCK_JSON_URL:
+            return _stock_mapping_response()
+        if url_str == CNINFO_QUERY_URL:
+            form = _read_form(request)
+            if form["category"] == "category_ndbg_szsh;":
+                return httpx.Response(503, json={"error": "temporarily unavailable"})
+            if form["category"] == "category_bndbg_szsh;":
+                return httpx.Response(200, json=h1_payload)
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _build_client(handler)
+    query = CnReportQuery(
+        market="CN",
+        normalized_ticker="002594",
+        start_date="2024-01-01",
+        end_date="2025-12-31",
+        target_periods=("FY", "H1"),
+    )
+    profile = client.resolve_company(query)
+
+    with pytest.raises(RuntimeError, match="period=FY"):
+        client.list_report_candidates(query, profile)
+
+
+def test_list_report_candidates_raises_when_period_query_fails() -> None:
+    """巨潮公告分类请求失败时应抛错，让 workflow 返回 failed。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if url_str == CNINFO_STOCK_JSON_URL:
+            return _stock_mapping_response()
+        if url_str == CNINFO_QUERY_URL:
+            return httpx.Response(503, json={"error": "temporarily unavailable"})
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    client = _build_client(handler)
+    query = CnReportQuery(
+        market="CN",
+        normalized_ticker="002594",
+        start_date="2024-01-01",
+        end_date="2025-12-31",
+        target_periods=("FY",),
+    )
+    profile = client.resolve_company(query)
+
+    with pytest.raises(RuntimeError, match="period=FY"):
+        client.list_report_candidates(query, profile)
 
 
 def test_list_report_candidates_filters_non_pdf_and_other_sec_code() -> None:
@@ -872,6 +970,70 @@ def test_download_report_pdf_returns_asset_with_sha256() -> None:
     assert asset.pdf_path.exists()
     assert asset.pdf_path.read_bytes().startswith(b"%PDF-")
     asset.pdf_path.unlink()
+
+
+def test_download_report_pdf_does_not_sleep_before_first_request() -> None:
+    """首次请求不应被 sleep_seconds 延迟，等待只发生在重试之间。"""
+
+    payload = _build_pdf_payload()
+    sleep_calls: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload)
+
+    client = CninfoDiscoveryClient(
+        client=_build_transport(handler),
+        sleep_seconds=0.3,
+        max_retries=2,
+        sleep_func=sleep_calls.append,
+    )
+    asset = client.download_report_pdf(_make_candidate())
+
+    assert sleep_calls == []
+    asset.pdf_path.unlink()
+
+
+def test_download_report_pdf_throttles_between_successful_requests() -> None:
+    """连续成功请求之间应按 sleep_seconds 补足主源保护间隔。"""
+
+    payload = _build_pdf_payload()
+    sleep_calls: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload)
+
+    client = CninfoDiscoveryClient(
+        client=_build_transport(handler),
+        sleep_seconds=0.3,
+        max_retries=2,
+        sleep_func=sleep_calls.append,
+    )
+    first = client.download_report_pdf(_make_candidate())
+    second = client.download_report_pdf(_make_candidate())
+
+    assert len(sleep_calls) == 1
+    assert 0 < sleep_calls[0] <= 0.3
+    first.pdf_path.unlink()
+    second.pdf_path.unlink()
+
+
+def test_download_report_pdf_uses_unique_temp_paths_for_same_candidate() -> None:
+    """同一 candidate 并发/重复下载也应落到不同临时文件路径。"""
+
+    payload = _build_pdf_payload()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload)
+
+    client = _build_client(handler)
+    first = client.download_report_pdf(_make_candidate())
+    second = client.download_report_pdf(_make_candidate())
+
+    assert first.pdf_path != second.pdf_path
+    assert first.pdf_path.exists()
+    assert second.pdf_path.exists()
+    first.pdf_path.unlink()
+    second.pdf_path.unlink()
 
 
 def test_download_report_pdf_rejects_short_content() -> None:

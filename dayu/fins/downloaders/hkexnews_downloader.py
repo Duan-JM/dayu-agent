@@ -63,6 +63,7 @@ _PERIOD_SORT_KEY: Final[dict[CnFiscalPeriod, int]] = {
     "Q1": 2,
     "Q2": 3,
     "Q3": 4,
+    "Q4": 5,
 }
 
 _PDF_MAGIC_BYTES: Final[bytes] = b"%PDF-"
@@ -96,9 +97,25 @@ _PERIOD_INFERENCE_TOKENS: Final[dict[CnFiscalPeriod, tuple[str, ...]]] = {
     "FY": ("ANNUAL REPORT", "年報", "年报", "年度報告", "年度报告"),
     "H1": ("INTERIM REPORT", "HALF-YEAR", "HALF YEAR", "中期報告", "中期报告", "半年報", "半年度報告"),
     "Q1": ("FIRST QUARTER", "FIRST QUARTERLY", "THREE MONTHS", "3 MONTHS", "第一季度", "第一季", "一季度", "一季", "三個月", "三个月"),
+    "Q2": ("SECOND QUARTER", "SECOND QUARTERLY", "SIX MONTHS", "6 MONTHS", "HALF YEAR", "Q2", "第二季度", "第二季", "二季度", "二季", "六個月", "六个月", "半年"),
     "Q3": ("THIRD QUARTER", "THIRD QUARTERLY", "NINE MONTHS", "9 MONTHS", "第三季度", "第三季", "三季度", "三季", "九個月", "九个月"),
+    "Q4": ("FOURTH QUARTER", "FOURTH QUARTERLY", "TWELVE MONTHS", "12 MONTHS", "FULL YEAR", "Q4", "第四季度", "第四季", "四季度", "四季", "十二個月", "十二个月", "全年"),
 }
 _TITLE_YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"(20\d{2}|19\d{2})")
+_TITLE_CHINESE_YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"([零〇一二三四五六七八九]{4})年")
+_CHINESE_DIGIT_TO_INT: Final[dict[str, int]] = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
 _DATE_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"(?P<year>\d{4})[-/](?P<month>\d{1,2})[-/](?P<day>\d{1,2})"
 )
@@ -157,12 +174,22 @@ _PERIOD_TO_CATEGORY_SPEC: Final[dict[CnFiscalPeriod, _HkCategorySpec]] = {
         t2_group_code=_HKEXNEWS_T2_GROUP_ALL,
         t2code=_HKEXNEWS_T2_INTERIM_REPORT,
     ),
+    "Q2": _HkCategorySpec(
+        t1code=_HKEXNEWS_T1_ANNOUNCEMENTS,
+        t2_group_code=_HKEXNEWS_T2_GROUP_RESULTS,
+        t2code=_HKEXNEWS_T2_QUARTERLY_RESULTS,
+    ),
     "Q1": _HkCategorySpec(
         t1code=_HKEXNEWS_T1_ANNOUNCEMENTS,
         t2_group_code=_HKEXNEWS_T2_GROUP_RESULTS,
         t2code=_HKEXNEWS_T2_QUARTERLY_RESULTS,
     ),
     "Q3": _HkCategorySpec(
+        t1code=_HKEXNEWS_T1_ANNOUNCEMENTS,
+        t2_group_code=_HKEXNEWS_T2_GROUP_RESULTS,
+        t2code=_HKEXNEWS_T2_QUARTERLY_RESULTS,
+    ),
+    "Q4": _HkCategorySpec(
         t1code=_HKEXNEWS_T1_ANNOUNCEMENTS,
         t2_group_code=_HKEXNEWS_T2_GROUP_RESULTS,
         t2code=_HKEXNEWS_T2_QUARTERLY_RESULTS,
@@ -216,6 +243,7 @@ class HkexnewsDiscoveryClient:
         self._sleep_func: Callable[[float], None] = (
             sleep_func if sleep_func is not None else time.sleep
         )
+        self._last_request_finished_at: float | None = None
         self._stock_mapping_cache: dict[str, _HkStockMappingEntry] | None = None
 
     def close(self) -> None:
@@ -274,11 +302,11 @@ class HkexnewsDiscoveryClient:
             profile: ``resolve_company`` 返回的公司元数据。
 
         Returns:
-            候选报告 tuple。HK Q1/Q3 查无返回空 tuple，不抛异常。
+            候选报告 tuple。HK 季度报告查无返回空 tuple，不抛异常。
 
         Raises:
             ValueError: market/provider/company_id 非法时抛出。
-            RuntimeError: 主源请求失败时抛出。
+            RuntimeError: 任一有效财期分类的底层请求或 JSON 解析失败时抛出。
         """
 
         if query.market != "HK":
@@ -291,23 +319,35 @@ class HkexnewsDiscoveryClient:
         stock_code = _to_hkex_stock_code(query.normalized_ticker)
 
         grouped: dict[tuple[CnFiscalPeriod, int], list[_RawHkAnnouncement]] = {}
+        periods_by_category: dict[_HkCategorySpec, list[CnFiscalPeriod]] = {}
         for period in query.target_periods:
             category_spec = _PERIOD_TO_CATEGORY_SPEC.get(period)
             if category_spec is None:
+                Log.warn(f"未知 fiscal_period={period!r}，已跳过", module=_MODULE)
                 continue
-            announcements = self._query_period_announcements(
-                stock_id=stock_id,
-                stock_code=stock_code,
-                category_spec=category_spec,
-                start_date=query.start_date,
-                end_date=query.end_date,
-            )
+            periods = periods_by_category.setdefault(category_spec, [])
+            if period not in periods:
+                periods.append(period)
+
+        for category_spec, requested_periods in periods_by_category.items():
+            try:
+                announcements = self._query_period_announcements(
+                    stock_id=stock_id,
+                    stock_code=stock_code,
+                    category_spec=category_spec,
+                    start_date=query.start_date,
+                    end_date=query.end_date,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"披露易公告分类查询失败: stock_code={stock_code} periods={','.join(requested_periods)} error={exc}"
+                ) from exc
             for item in announcements:
                 inferred_period = _infer_fiscal_period_from_text(
                     title=item.title,
                     category_text=item.category_text,
                 )
-                if inferred_period != period:
+                if inferred_period not in requested_periods:
                     continue
                 fiscal_year = _infer_fiscal_year(
                     title=item.title,
@@ -315,7 +355,7 @@ class HkexnewsDiscoveryClient:
                 )
                 if fiscal_year is None:
                     continue
-                grouped.setdefault((period, fiscal_year), []).append(item)
+                grouped.setdefault((inferred_period, fiscal_year), []).append(item)
 
         candidates: list[CnReportCandidate] = []
         for (period, fiscal_year), items in grouped.items():
@@ -359,8 +399,14 @@ class HkexnewsDiscoveryClient:
         sha256 = hashlib.sha256(payload).hexdigest()
         tmp_dir = Path(tempfile.gettempdir()) / "dayu_hk_downloads"
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        pdf_path = tmp_dir / f"hkexnews_{candidate.source_id}.pdf"
-        pdf_path.write_bytes(payload)
+        with tempfile.NamedTemporaryFile(
+            prefix="hkexnews_",
+            suffix=".pdf",
+            dir=tmp_dir,
+            delete=False,
+        ) as fp:
+            fp.write(payload)
+            pdf_path = Path(fp.name)
         return DownloadedReportAsset(
             candidate=candidate,
             pdf_path=pdf_path,
@@ -515,11 +561,14 @@ class HkexnewsDiscoveryClient:
 
         last_exc: Optional[Exception] = None
         for attempt in range(self._max_retries):
-            self._sleep_between_requests()
             try:
-                response = self._client.get(url, params=params)
-                response.raise_for_status()
-                return cast(JsonValue, response.json())
+                self._throttle_before_request()
+                try:
+                    response = self._client.get(url, params=params)
+                    response.raise_for_status()
+                    return cast(JsonValue, response.json())
+                finally:
+                    self._mark_request_finished()
             except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
                 last_exc = exc
                 self._retry_backoff(attempt)
@@ -539,9 +588,12 @@ class HkexnewsDiscoveryClient:
         """
 
         try:
-            self._sleep_between_requests()
-            response = self._client.head(url, follow_redirects=True)
-            response.raise_for_status()
+            self._throttle_before_request()
+            try:
+                response = self._client.head(url, follow_redirects=True)
+                response.raise_for_status()
+            finally:
+                self._mark_request_finished()
         except httpx.HTTPError as exc:
             Log.warn(f"HEAD 失败: url={url} error={exc}", module=_MODULE)
             return _HeadMeta(content_length=None, etag=None, last_modified=None)
@@ -571,18 +623,21 @@ class HkexnewsDiscoveryClient:
 
         last_exc: Optional[Exception] = None
         for attempt in range(self._max_retries):
-            self._sleep_between_requests()
             try:
-                response = self._client.get(url, follow_redirects=True)
-                response.raise_for_status()
-                return response.content
+                self._throttle_before_request()
+                try:
+                    response = self._client.get(url, follow_redirects=True)
+                    response.raise_for_status()
+                    return response.content
+                finally:
+                    self._mark_request_finished()
             except httpx.HTTPError as exc:
                 last_exc = exc
                 self._retry_backoff(attempt)
         raise RuntimeError(f"PDF 下载失败: url={url} error={last_exc}")
 
-    def _sleep_between_requests(self) -> None:
-        """请求前 sleep。
+    def _throttle_before_request(self) -> None:
+        """按连续请求间隔限制发起 HTTP 请求。
 
         Args:
             无。
@@ -594,9 +649,27 @@ class HkexnewsDiscoveryClient:
             无。
         """
 
-        if self._sleep_seconds <= 0:
-            return
-        self._sleep_func(self._sleep_seconds)
+        now = time.monotonic()
+        if self._sleep_seconds > 0 and self._last_request_finished_at is not None:
+            elapsed = now - self._last_request_finished_at
+            remaining = self._sleep_seconds - elapsed
+            if remaining > 0:
+                self._sleep_func(remaining)
+
+    def _mark_request_finished(self) -> None:
+        """记录最近一次 HTTP 请求结束时间。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._last_request_finished_at = time.monotonic()
 
     def _retry_backoff(self, attempt_index: int) -> None:
         """指数退避。
@@ -931,8 +1004,40 @@ def _infer_fiscal_year(title: str, filing_date: str) -> int | None:
     matched = _TITLE_YEAR_PATTERN.search(title)
     if matched is not None:
         return int(matched.group(1))
+    chinese_matched = _TITLE_CHINESE_YEAR_PATTERN.search(title)
+    if chinese_matched is not None:
+        chinese_year = _parse_chinese_digit_year(chinese_matched.group(1))
+        if chinese_year is not None:
+            return chinese_year
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", filing_date):
         return int(filing_date[:4])
+    return None
+
+
+def _parse_chinese_digit_year(value: str) -> int | None:
+    """解析 ``二零二五`` 这类逐位中文数字年份。
+
+    Args:
+        value: 四位中文数字年份。
+
+    Returns:
+        解析出的公历年份；格式或范围异常返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if len(value) != 4:
+        return None
+    digits: list[str] = []
+    for char in value:
+        digit = _CHINESE_DIGIT_TO_INT.get(char)
+        if digit is None:
+            return None
+        digits.append(str(digit))
+    year = int("".join(digits))
+    if 1900 <= year <= 2099:
+        return year
     return None
 
 
@@ -955,7 +1060,12 @@ def _infer_fiscal_period_from_text(
     """
 
     combined = f"{title} {category_text}".upper()
-    for period in ("H1", "Q3", "Q1", "FY"):
+    normalized_category = category_text.upper()
+    if "季度" in category_text or "QUARTER" in normalized_category:
+        order: tuple[CnFiscalPeriod, ...] = ("Q4", "Q3", "Q2", "Q1", "H1", "FY")
+    else:
+        order = ("H1", "FY", "Q4", "Q3", "Q2", "Q1")
+    for period in order:
         tokens = _PERIOD_INFERENCE_TOKENS[period]
         if any(token.upper() in combined for token in tokens):
             return period

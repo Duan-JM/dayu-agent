@@ -1,7 +1,8 @@
 """巨潮 CN 财报下载器。
 
 实现 :class:`CnReportDiscoveryClientProtocol`，覆盖 A 股年报 / 半年报 /
-一季报 / 三季报的 discovery 与 PDF 下载。
+一季报 / 三季报的 discovery 与 PDF 下载。巨潮当前没有稳定的独立 Q2/Q4
+分类证据，直接请求 Q2/Q4 时返回空候选，由 workflow 统一标记 skipped。
 
 设计要点：
 
@@ -21,8 +22,8 @@
 - 同 ``fiscal_period`` 多版本：``amended=True`` 优先，再按
   ``announcementTime`` 取最新；无 amended 时取最新一条全文。
 - HEAD 失败、PDF magic bytes 校验失败仅影响该 candidate，不让整个
-  ticker 流程崩。本模块只在 ``download_report_pdf`` 抛 ``RuntimeError``，
-  在 ``list_report_candidates`` 用 ``Log.warn`` 软失败 + 继续下一类。
+  ticker 流程崩。公告分类查询失败属于 discovery 阶段远端错误，必须抛
+  ``RuntimeError``，避免被 workflow 误报成缺报告 skipped。
 - 接口契约 / 公告字段非正式开放，参数随时变化；本模块**只**消费稳定字段，
   其余字段忽略，避免实现绑死巨潮 schema。
 """
@@ -73,6 +74,9 @@ _PERIOD_TO_CATEGORY: Final[dict[CnFiscalPeriod, str]] = {
     "Q1": "category_yjdbg_szsh;",
     "Q3": "category_sjdbg_szsh;",
 }
+_CNINFO_UNSUPPORTED_INDEPENDENT_PERIODS: Final[frozenset[CnFiscalPeriod]] = frozenset(
+    {"Q2", "Q4"}
+)
 
 # 标题黑名单关键词：命中即排除（大小写不敏感）。
 _TITLE_BLOCKLIST: Final[tuple[str, ...]] = (
@@ -195,6 +199,7 @@ class CninfoDiscoveryClient:
         self._sleep_func: Callable[[float], None] = (
             sleep_func if sleep_func is not None else time.sleep
         )
+        self._last_request_finished_at: float | None = None
         self._stock_mapping_cache: dict[str, _CninfoCompanyLookupEntry] | None = None
 
     def close(self) -> None:
@@ -265,7 +270,8 @@ class CninfoDiscoveryClient:
             稳定顺序排序。
 
         Raises:
-            ValueError: 主源响应无法解析为 JSON 时抛出。
+            ValueError: market/provider/company_id 非法时抛出。
+            RuntimeError: 任一有效财期分类的底层请求或 JSON 解析失败时抛出。
         """
 
         if query.market != "CN":
@@ -282,20 +288,28 @@ class CninfoDiscoveryClient:
         for period in query.target_periods:
             category = _PERIOD_TO_CATEGORY.get(period)
             if category is None:
-                # 上游已把 Q2 归一为 H1；其它字面量不应到此。
-                Log.warn(
-                    f"未知 fiscal_period={period!r}，已跳过", module=_MODULE
-                )
+                if period in _CNINFO_UNSUPPORTED_INDEPENDENT_PERIODS:
+                    Log.warn(
+                        f"巨潮暂无独立 fiscal_period={period!r} 分类，已按无候选跳过",
+                        module=_MODULE,
+                    )
+                    continue
+                Log.warn(f"未知 fiscal_period={period!r}，已跳过", module=_MODULE)
                 continue
-            announcements = self._query_announcements(
-                column=context.column,
-                plate=context.plate,
-                stock=ticker,
-                org_id=org_id,
-                category=category,
-                start_date=query.start_date,
-                end_date=query.end_date,
-            )
+            try:
+                announcements = self._query_announcements(
+                    column=context.column,
+                    plate=context.plate,
+                    stock=ticker,
+                    org_id=org_id,
+                    category=category,
+                    start_date=query.start_date,
+                    end_date=query.end_date,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"巨潮公告分类查询失败: ticker={ticker} period={period} category={category} error={exc}"
+                ) from exc
             for item in announcements:
                 if _is_title_blocked(item.title):
                     continue
@@ -356,9 +370,14 @@ class CninfoDiscoveryClient:
         downloaded_at = _utc_now_isoformat()
         tmp_dir = Path(tempfile.gettempdir()) / "dayu_cn_downloads"
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        # 文件名稳定：``{source_id}.pdf``，便于在调用方层面做幂等暂存。
-        pdf_path = tmp_dir / f"cninfo_{candidate.source_id}.pdf"
-        pdf_path.write_bytes(payload)
+        with tempfile.NamedTemporaryFile(
+            prefix="cninfo_",
+            suffix=".pdf",
+            dir=tmp_dir,
+            delete=False,
+        ) as fp:
+            fp.write(payload)
+            pdf_path = Path(fp.name)
         return DownloadedReportAsset(
             candidate=candidate,
             pdf_path=pdf_path,
@@ -627,11 +646,14 @@ class CninfoDiscoveryClient:
 
         last_exc: Optional[Exception] = None
         for attempt in range(self._max_retries):
-            self._sleep_between_requests()
             try:
-                response = self._client.get(url)
-                response.raise_for_status()
-                return cast(JsonValue, response.json())
+                self._throttle_before_request()
+                try:
+                    response = self._client.get(url)
+                    response.raise_for_status()
+                    return cast(JsonValue, response.json())
+                finally:
+                    self._mark_request_finished()
             except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
                 last_exc = exc
                 Log.debug(
@@ -657,11 +679,14 @@ class CninfoDiscoveryClient:
 
         last_exc: Optional[Exception] = None
         for attempt in range(self._max_retries):
-            self._sleep_between_requests()
             try:
-                response = self._client.post(url, data=data)
-                response.raise_for_status()
-                return cast(JsonValue, response.json())
+                self._throttle_before_request()
+                try:
+                    response = self._client.post(url, data=data)
+                    response.raise_for_status()
+                    return cast(JsonValue, response.json())
+                finally:
+                    self._mark_request_finished()
             except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
                 last_exc = exc
                 Log.debug(
@@ -685,9 +710,12 @@ class CninfoDiscoveryClient:
         """
 
         try:
-            self._sleep_between_requests()
-            response = self._client.head(url, follow_redirects=True)
-            response.raise_for_status()
+            self._throttle_before_request()
+            try:
+                response = self._client.head(url, follow_redirects=True)
+                response.raise_for_status()
+            finally:
+                self._mark_request_finished()
         except httpx.HTTPError as exc:
             Log.warn(f"HEAD 失败: url={url} error={exc}", module=_MODULE)
             return _HeadMeta(content_length=None, etag=None, last_modified=None)
@@ -719,11 +747,14 @@ class CninfoDiscoveryClient:
 
         last_exc: Optional[Exception] = None
         for attempt in range(self._max_retries):
-            self._sleep_between_requests()
             try:
-                response = self._client.get(url, follow_redirects=True)
-                response.raise_for_status()
-                return response.content
+                self._throttle_before_request()
+                try:
+                    response = self._client.get(url, follow_redirects=True)
+                    response.raise_for_status()
+                    return response.content
+                finally:
+                    self._mark_request_finished()
             except httpx.HTTPError as exc:
                 last_exc = exc
                 Log.debug(
@@ -733,12 +764,40 @@ class CninfoDiscoveryClient:
                 self._retry_backoff(attempt)
         raise RuntimeError(f"PDF 下载失败: url={url} error={last_exc}")
 
-    def _sleep_between_requests(self) -> None:
-        """每次请求前等待 ``self._sleep_seconds`` 秒。"""
+    def _throttle_before_request(self) -> None:
+        """按连续请求间隔限制发起 HTTP 请求。
 
-        if self._sleep_seconds <= 0:
-            return
-        self._sleep_func(self._sleep_seconds)
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        now = time.monotonic()
+        if self._sleep_seconds > 0 and self._last_request_finished_at is not None:
+            elapsed = now - self._last_request_finished_at
+            remaining = self._sleep_seconds - elapsed
+            if remaining > 0:
+                self._sleep_func(remaining)
+
+    def _mark_request_finished(self) -> None:
+        """记录最近一次 HTTP 请求结束时间。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._last_request_finished_at = time.monotonic()
 
     def _retry_backoff(self, attempt_index: int) -> None:
         """指数退避：``RETRY_BACKOFF_BASE_SECONDS * 2**attempt_index``。"""
@@ -778,6 +837,7 @@ _PERIOD_SORT_KEY: Final[dict[CnFiscalPeriod, int]] = {
     "Q1": 2,
     "Q2": 3,
     "Q3": 4,
+    "Q4": 5,
 }
 
 _TITLE_FY_PATTERN: Final[re.Pattern[str]] = re.compile(r"(\d{4})\s*年[年度]?\s*(年度报告|年报)")
